@@ -15,16 +15,17 @@ SEED=2025
 
 # Prompts from gen-fg_only.ipynb
 #; a young black boy with straight brown hair, wearing a brown T-shirt and blue shorts
+# 场景3：公园 (3背景 + 3动作)
 BG_PROMPTS=(
-    "in a colorful theme park, roller coasters and amusement rides in the background,"
-    "in an arcade, flashing lights and game machines in the background,"
-    "in a fantasy-themed park, castles and fairy tale characters in the background,"
+    "In a sunny park with green grass and blooming flowers,"
+    "In a peaceful park with a small pond and willow trees,"
+    "In a park playground with colorful equipment and benches,"
 )
-FG_PROMPT="a young white boy with curly black hair, wearing a blue T-shirt and brown shorts, smiling and a young black boy with straight red hair, wearing a brown T-shirt and blue shorts, crying"
+FG_PROMPT="a little girl with pigtails, wearing a yellow dress, and a little boy with cap, wearing shorts and a t-shirt,"
 ACT_PROMPTS=(
-    "riding a roller coaster, excited expression, front view"
-    "playing an arcade game, focused expression, side view"
-    "posing with a costumed character, happy expression, front view"
+    "running with a kite, laughing, full body view"
+    "sitting on a bench, eating ice cream, happy expression, front view"
+    "playing on a swing, excited expression, dynamic view"
 )
 
 # Create temporary prompts file
