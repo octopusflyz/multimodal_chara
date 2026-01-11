@@ -9,7 +9,12 @@ Official implementation of ICCV 2025 paper - CharaConsist: Fine-Grained Consiste
 
 ## Update
 ----
-
+## Branches
+- origin: 原始工作代码，我们添加了的一个快速简易运行的脚本run_inference.sh, 和可视化报告所述点匹配失败的脚本point.sh
+- modified: 报告所述改进后的代码，当前效果尚有欠缺，持续更新中
+- adain：报告中讨论部分提及，曾尝试过风格引导来约束一致性的尝试，但是现在效果看上去这种train-free方法对风格捕捉较差，暂时放弃。
+- sam-mask：报告中讨论部分提及，曾尝试过利用sam进行mask分割，但是认为这个mask在早期步就需要，sam识别不到足够的语义信息，此分支跑出来可视化效果很差，暂时放弃。
+----
 
 
 ## How to use
