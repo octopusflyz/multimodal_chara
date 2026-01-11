@@ -9,6 +9,7 @@ parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
 parser.add_argument("--save_point_match", action='store_true')
+parser.add_argument("--visualize_denoise_steps", type=str, default="", help="Comma-separated list of denoising steps to visualize masks (e.g., '10,20,30,40,50'). Steps are 1-indexed from the start of denoising.")
 parser.add_argument("--point_match_dir", type=str, default="")
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
@@ -152,11 +153,11 @@ def load_prompt_file(pipe, file_path):
                 act = parts[-1]
                 fg = "#".join(parts[1:-1])  # 中间的都是fg描述
                 prompt, bg_len, real_len, num_objects, object_token_ranges = modify_prompt_and_get_length(bg, fg, act, pipe)
-                curr_prompts.append(prompt)
-                curr_bg_len.append(bg_len)
-                curr_real_len.append(real_len)
-                curr_num_objects.append(num_objects)
-                curr_object_ranges.append(object_token_ranges)
+            curr_prompts.append(prompt)
+            curr_bg_len.append(bg_len)
+            curr_real_len.append(real_len)
+            curr_num_objects.append(num_objects)
+            curr_object_ranges.append(object_token_ranges)
         else:
             all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges))
             curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges = [], [], [], [], []
@@ -310,11 +311,22 @@ if __name__ == "__main__":
     # Load prompts
     all_prompt_info = load_prompt_file(pipe, args.prompts_file)
 
+    # 解析visualize_denoise_steps参数
+    visualize_denoise_steps = None
+    if args.visualize_denoise_steps:
+        try:
+            visualize_denoise_steps = [int(x.strip()) for x in args.visualize_denoise_steps.split(',')]
+            print(f"Will visualize masks at denoising steps: {visualize_denoise_steps}")
+        except ValueError:
+            print(f"Warning: Invalid visualize_denoise_steps format: {args.visualize_denoise_steps}")
+            visualize_denoise_steps = None
+
     pipe_kwargs = dict(
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
-        share_bg = args.share_bg
+        share_bg = args.share_bg,
+        visualize_denoise_steps = visualize_denoise_steps
     )
 
     # Collect all prompts for metadata
@@ -325,9 +337,11 @@ if __name__ == "__main__":
     for prompt_ind, (prompts, bg_lens, real_lens, num_objects_list, object_ranges_list) in enumerate(all_prompt_info):
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
         os.makedirs(out_dir, exist_ok=True)
-        if args.save_mask:
+        if args.save_mask or visualize_denoise_steps is not None:
             mask_out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "mask")
             os.makedirs(mask_out_dir, exist_ok=True)
+            # 设置pipeline的mask保存目录
+            pipe._mask_save_dir = mask_out_dir
         id_prompt = prompts[0]
         frm_prompts = prompts[1:]
 
@@ -415,31 +429,31 @@ if __name__ == "__main__":
             print("ID-only mode: Skipping frame generation")
         else:
             spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
-            print("#" * 50)
-            print("Generating frame images ...")
-            for ind, prompt in enumerate(frm_prompts):
-                frame_num_objects, frame_object_ranges = num_objects_list[1:][ind], object_ranges_list[1:][ind]
-                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind], num_objects=frame_num_objects, object_token_ranges=frame_object_ranges)
+        print("#" * 50)
+        print("Generating frame images ...")
+        for ind, prompt in enumerate(frm_prompts):
+            frame_num_objects, frame_object_ranges = num_objects_list[1:][ind], object_ranges_list[1:][ind]
+            set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind], num_objects=frame_num_objects, object_token_ranges=frame_object_ranges)
 
-                # Parse frame prompt
-                if "#" in prompt:
-                    bg_part, fg_part, act_part = prompt.split("#", 2)
-                    frame_bg_prompt = bg_part.strip()
-                    frame_act_prompt = act_part.strip()
-                else:
-                    frame_bg_prompt = ""
-                    frame_act_prompt = prompt
+            # Parse frame prompt
+            if "#" in prompt:
+                bg_part, fg_part, act_part = prompt.split("#", 2)
+                frame_bg_prompt = bg_part.strip()
+                frame_act_prompt = act_part.strip()
+            else:
+                frame_bg_prompt = ""
+                frame_act_prompt = prompt
 
-                pre_images, spatial_kwargs = pipe(
-                    prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
-                pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")
-                images, spatial_kwargs = pipe(
-                    prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
-                images[0].save(f"{out_dir}/{ind}.jpg")
+            pre_images, spatial_kwargs = pipe(
+                prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
+            pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")
+            images, spatial_kwargs = pipe(
+                prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
+            images[0].save(f"{out_dir}/{ind}.jpg")
 
                 # 保存mask（单对象/合并mask）
-                if args.save_mask:
-                    overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+            if args.save_mask:
+                overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
 
                 # 检查是否有多个对象mask，进行多对象可视化
                 frame_object_masks = spatial_kwargs.get("curr_fg_masks", None)
@@ -457,27 +471,27 @@ if __name__ == "__main__":
                             save_path=save_path
                         )
 
-                # Save frame data for visualization
-                frame_data = {
-                    "index": ind,
-                    "image": np.array(images[0]),
-                    "mask": spatial_kwargs["curr_fg_mask"][0].cpu().numpy(),
-                    "prompt": prompt,
-                    "bg_prompt": frame_bg_prompt,
-                    "act_prompt": frame_act_prompt
-                }
+            # Save frame data for visualization
+            frame_data = {
+                "index": ind,
+                "image": np.array(images[0]),
+                "mask": spatial_kwargs["curr_fg_mask"][0].cpu().numpy(),
+                "prompt": prompt,
+                "bg_prompt": frame_bg_prompt,
+                "act_prompt": frame_act_prompt
+            }
 
-                # 如果有多个对象mask，添加到帧数据中
-                if frame_object_masks is not None and len(frame_object_masks) > 1:
-                    frame_data["object_masks"] = [mask.cpu().numpy() for mask in frame_object_masks]
+            # 如果有多个对象mask，添加到帧数据中
+            if frame_object_masks is not None and len(frame_object_masks) > 1:
+                frame_data["object_masks"] = [mask.cpu().numpy() for mask in frame_object_masks]
 
-                # Add point matching data if available
-                if "argmax_indices" in spatial_kwargs:
-                    frame_data["argmax_indices"] = spatial_kwargs["argmax_indices"][0].cpu().to(torch.int64).numpy()
-                if "max_sim" in spatial_kwargs:
-                    frame_data["max_sim"] = spatial_kwargs["max_sim"][0].cpu().to(torch.float32).numpy()
+            # Add point matching data if available
+            if "argmax_indices" in spatial_kwargs:
+                frame_data["argmax_indices"] = spatial_kwargs["argmax_indices"][0].cpu().to(torch.int64).numpy()
+            if "max_sim" in spatial_kwargs:
+                frame_data["max_sim"] = spatial_kwargs["max_sim"][0].cpu().to(torch.float32).numpy()
 
-                payload["frames"].append(frame_data)
+            payload["frames"].append(frame_data)
 
         # Save point match data for this prompt set
         save_point_match_data(args.out_dir, payload, f"_prompt_{prompt_ind}")

@@ -4,11 +4,11 @@
 
 # Model and hardware settings
 INIT_MODE=2
-GPU_IDS="5 6"
+GPU_IDS="4 6"
 # For quick testing, limit to first prompt only
 QUICK_TEST=false
 MODEL_PATH="/mnt/netdisk2/zhangyf/model/FLUX.1-dev"
-OUT_DIR="results/mask/two_people_simple_v2_sep"
+OUT_DIR="results/mask/two_people_simple_v7_sep"
 
 # Image settings
 HEIGHT=1024
@@ -22,7 +22,7 @@ BG_PROMPTS=(
     "in an arcade, flashing lights and game machines in the background,"
     "in a fantasy-themed park, castles and fairy tale cartoon characters in the background,"
 )
-FG_PROMPT="a young white boy with curly brown hair, wearing a blue T-shirt and brown shorts, # a young black boy with straight brown hair, wearing a brown T-shirt and blue shorts, "
+FG_PROMPT="a young white boy with curly brown hair, wearing a blue T-shirt and brown shorts, # a young black boy with brown straight hair, wearing a brown T-shirt and blue shorts, "
 ACT_PROMPTS=(
     "riding a roller coaster, excited expression, front view"
     "playing an arcade game, focused expression, side view"

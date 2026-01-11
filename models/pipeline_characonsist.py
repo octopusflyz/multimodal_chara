@@ -72,7 +72,8 @@ class CharaConsistPipeline(FluxPipeline):
         interpolate_end_step: int = 31,
         interpolate_weight: float = 0.8,
         sim_thr = 0.5,
-        save_mask_point_step: int = 10
+        save_mask_point_step: int = 10,
+        visualize_denoise_steps: List[int] = None
     ):
         
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -217,7 +218,22 @@ class CharaConsistPipeline(FluxPipeline):
                 if self.interrupt:
                     continue
 
+                # 检查是否需要在此步骤保存mask可视化
+                save_denoise_mask = (visualize_denoise_steps is not None and
+                                   (i + 1) in visualize_denoise_steps)  # i从0开始，所以加1
+
                 self._joint_attention_kwargs = get_consist_kwargs(i)
+
+                # 如果需要可视化此步骤，确保启用mask计算
+                if save_denoise_mask and not self._joint_attention_kwargs["save_attn_weight"]:
+                    print(f"[DEBUG] Enabling save_attn_weight for visualization at step {i+1}")
+                    self._joint_attention_kwargs["save_attn_weight"] = True
+
+                if visualize_denoise_steps is not None and i < 3:  # 只在前3步打印调试信息
+                    print(f"[DEBUG] Step {i+1}/{len(timesteps)}, save_denoise_mask: {save_denoise_mask}, target_steps: {visualize_denoise_steps}")
+                    print(f"[DEBUG] Current save_attn_weight: {self._joint_attention_kwargs['save_attn_weight']}")
+
+                original_save_attn_weight = self._joint_attention_kwargs["save_attn_weight"]
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -262,7 +278,15 @@ class CharaConsistPipeline(FluxPipeline):
                         spatial_kwargs["curr_fg_mask"] = curr_fg_mask
                         if update_bg:
                             spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
-                        
+
+                    # 检查是否需要保存此步骤的可视化
+                    if save_denoise_mask and "curr_fg_mask" in spatial_kwargs:
+                        print(f"[DEBUG] Saving denoise step visualization for step {i+1}")
+                        self._save_denoise_step_mask_visualization(
+                            spatial_kwargs, i + 1, latents, timestep, guidance,
+                            pooled_prompt_embeds, prompt_embeds, text_ids, latent_image_ids
+                        )
+
                 if self.joint_attention_kwargs["save_cross_sim"]:
                     avg_cross_sim = get_cross_sim(self)
                     max_sim, argmax_indices = torch.max(avg_cross_sim, dim=-1)
@@ -276,9 +300,9 @@ class CharaConsistPipeline(FluxPipeline):
                         id_fg_inds = id_fg_inds,
                         curr_fg_inds = curr_fg_inds,
                         max_sim=max_sim,
-                        argmax_indices=argmax_indices, 
+                        argmax_indices=argmax_indices,
                     )
-                
+
                 if is_pre_run and (i == save_mask_point_step):
                     latents = (latents - self.scheduler.sigmas[i] * noise_pred)
                     break
@@ -321,5 +345,134 @@ class CharaConsistPipeline(FluxPipeline):
             return (image, spatial_kwargs)
 
         return FluxPipelineOutput(images=image)
+
+    def _save_denoise_step_mask_visualization(self, spatial_kwargs, step, latents, timestep, guidance,
+                                             pooled_prompt_embeds, prompt_embeds, text_ids, latent_image_ids):
+        """保存去噪步骤的mask可视化"""
+        print(f"[DEBUG] Starting denoise step mask visualization for step {step}")
+        try:
+            # 生成当前步骤的图像用于可视化
+            print(f"[DEBUG] Decoding latents for step {step}")
+            with torch.no_grad():
+                # 使用VAE解码当前的latents来获得图像
+                latents_for_viz = latents / self.vae.config.scaling_factor
+                image = self.vae.decode(latents_for_viz, return_dict=False)[0]
+                image = self.image_processor.postprocess(image, output_type="pil")[0]
+
+            # 获取mask
+            curr_fg_mask = spatial_kwargs.get("curr_fg_mask")
+            curr_fg_masks = spatial_kwargs.get("curr_fg_masks")
+
+            print(f"[DEBUG] Step {step}: curr_fg_mask is None: {curr_fg_mask is None}, curr_fg_masks length: {len(curr_fg_masks) if curr_fg_masks else 0}")
+
+            if curr_fg_mask is not None or curr_fg_masks is not None:
+                # 创建输出目录
+                import os
+                mask_dir = getattr(self, '_mask_save_dir', 'results/mask')
+                os.makedirs(mask_dir, exist_ok=True)
+                print(f"[DEBUG] Saving to directory: {mask_dir}")
+
+                # 保存mask可视化
+                if curr_fg_masks is not None and len(curr_fg_masks) > 1:
+                    print(f"[DEBUG] Saving multi-object visualization for step {step}")
+                    # 多对象mask可视化
+                    self._save_multi_object_mask_visualization(
+                        image, curr_fg_masks, curr_fg_mask, step, mask_dir
+                    )
+                elif curr_fg_mask is not None:
+                    print(f"[DEBUG] Saving single-object visualization for step {step}")
+                    # 单对象mask可视化
+                    self._save_single_mask_visualization(image, curr_fg_mask, step, mask_dir)
+
+        except Exception as e:
+            print(f"Warning: Failed to save denoise step mask visualization for step {step}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _save_single_mask_visualization(self, image, fg_mask, step, mask_dir):
+        """保存单对象mask可视化"""
+        try:
+            from PIL import Image
+            import numpy as np
+
+            # 将mask转换为numpy
+            mask_np = fg_mask[0].cpu().numpy().astype(np.uint8) * 255
+
+            # 创建叠加图像
+            overlay_img = self._create_overlay_image(image, mask_np)
+
+            # 保存
+            output_path = f"{mask_dir}/step_{step:03d}_mask.jpg"
+            overlay_img.save(output_path)
+            print(f"Saved denoise step mask visualization: {output_path}")
+
+        except Exception as e:
+            print(f"Warning: Failed to save single mask visualization: {e}")
+
+    def _save_multi_object_mask_visualization(self, image, fg_masks, overall_fg_mask, step, mask_dir):
+        """保存多对象mask可视化"""
+        try:
+            from PIL import Image
+            import numpy as np
+
+            # 创建4列布局：原图 + 整体前景 + 对象1 + 对象2
+            fig_width = image.width * 4
+            fig_height = image.height
+
+            # 创建大画布
+            combined_img = Image.new('RGB', (fig_width, fig_height))
+
+            # 列1：原图
+            combined_img.paste(image, (0, 0))
+
+            # 列2：整体前景mask
+            if overall_fg_mask is not None:
+                overall_mask_np = overall_fg_mask[0].cpu().numpy().astype(np.uint8) * 255
+                overall_overlay = self._create_overlay_image(image, overall_mask_np)
+                combined_img.paste(overall_overlay, (image.width, 0))
+
+            # 列3和4：各个对象mask
+            for obj_idx, fg_mask in enumerate(fg_masks):
+                if obj_idx < 2:  # 只显示前两个对象
+                    mask_np = fg_mask[0].cpu().numpy().astype(np.uint8) * 255
+                    obj_overlay = self._create_overlay_image(image, mask_np)
+                    x_offset = image.width * (obj_idx + 2)
+                    combined_img.paste(obj_overlay, (x_offset, 0))
+
+            # 保存
+            output_path = f"{mask_dir}/step_{step:03d}_denoise_masks.png"
+            combined_img.save(output_path)
+            print(f"Saved denoise step multi-object mask visualization: {output_path}")
+
+        except Exception as e:
+            print(f"Warning: Failed to save multi-object mask visualization: {e}")
+
+    def _create_overlay_image(self, base_image, mask_np):
+        """创建叠加mask的图像"""
+        try:
+            from PIL import Image
+            import numpy as np
+
+            # 确保mask是正确的形状
+            if mask_np.ndim == 3:
+                mask_np = mask_np[0]  # 去掉batch维度
+
+            # 调整mask大小以匹配图像
+            mask_img = Image.fromarray(mask_np).convert('L')
+            if mask_img.size != base_image.size:
+                mask_img = mask_img.resize(base_image.size, Image.BILINEAR)
+
+            # 创建红色叠加
+            overlay = Image.new('RGB', base_image.size, (255, 0, 0))
+            mask_colored = Image.new('RGB', base_image.size, (0, 0, 0))
+            mask_colored.paste(overlay, mask=mask_img)
+
+            # 叠加到原图
+            result = Image.blend(base_image, mask_colored, alpha=0.3)
+            return result
+
+        except Exception as e:
+            print(f"Warning: Failed to create overlay image: {e}")
+            return base_image
 
 

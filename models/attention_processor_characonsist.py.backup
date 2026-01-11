@@ -128,7 +128,7 @@ class CharaConsistAttnProcessor2_0:
     ):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-        
+
         self.text_seq_len = text_seq_len
         self.visual_seq_len = size[0] * size[1]
         # Hyper Params
@@ -142,6 +142,8 @@ class CharaConsistAttnProcessor2_0:
         self.num_objects = 1
         self.object_token_ranges = None
         self.fg_lengths = None
+        # 新增：位置到对象的映射缓存
+        self.position_to_object_cache = None
         # Save id info
         self.id_attn_bank = dict()
         self.attn_weights = dict()
@@ -190,35 +192,11 @@ class CharaConsistAttnProcessor2_0:
             F.normalize(id_hidden_states, dim=-1).transpose(-2, -1))
         return sim
     
-    def get_expand_attn_mask(self, id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device, num_objects=1, curr_fg_masks=None):
+    def get_expand_attn_mask(self, id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device):
         id_len = len(id_fg_mask)
         _id_fg_mask = id_fg_mask.view(1, 1, 1, -1)
-
-        if num_objects == 1 or curr_fg_masks is None:
-            # 单对象模式：保持原有逻辑
-            _curr_fg_mask = curr_fg_mask.view(1, 1, -1, 1)
-            expand_mask = _id_fg_mask != _curr_fg_mask
-        else:
-            # 多对象模式：基于前景vs背景的基本规则，但确保对象间不相互竞争
-            # 使用整体前景mask来保持基本的前景/背景attention规则
-            _curr_fg_mask = curr_fg_mask.view(1, 1, -1, 1)
-            expand_mask = _id_fg_mask != _curr_fg_mask
-
-            # 额外确保：不同对象的视觉区域不会attend到相同类型的ID位置
-            # 这防止了对象间的直接竞争
-            for obj_idx, obj_mask in enumerate(curr_fg_masks):
-                _obj_mask = obj_mask.view(1, 1, -1, 1)
-                # 对于非当前对象的视觉位置，屏蔽对前景ID位置的attention
-                # 这样可以减少对象间的竞争
-                other_objects_mask = torch.zeros_like(_obj_mask)
-                for other_idx, other_mask in enumerate(curr_fg_masks):
-                    if other_idx != obj_idx:
-                        other_objects_mask = other_objects_mask | other_mask.view(1, 1, -1, 1)
-
-                # 非当前对象的区域不能attend到前景ID位置（减少竞争）
-                foreground_id_mask = _id_fg_mask
-                expand_mask = expand_mask | (other_objects_mask & foreground_id_mask)
-
+        _curr_fg_mask = curr_fg_mask.view(1, 1, -1, 1)
+        expand_mask = _id_fg_mask != _curr_fg_mask
         if not bg_share_flag:
             expand_mask[:, :, :, ~id_fg_mask] = True
         elif not fg_share_flag:
@@ -283,13 +261,8 @@ class CharaConsistAttnProcessor2_0:
                 saved_value = saved_value_fg
                 id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
         
-        # 提取多对象参数
-        num_objects = kwargs.get('num_objects', 1)
-        curr_fg_masks = kwargs.get('curr_fg_masks', None)
-
         expand_mask= self.get_expand_attn_mask(
-            id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device,
-            num_objects=num_objects, curr_fg_masks=curr_fg_masks)
+            id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device)
         attention_mask = torch.zeros(
             (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)), 
             device=device, dtype=torch.bfloat16)
@@ -372,139 +345,33 @@ class CharaConsistAttnProcessor2_0:
             key = attn.norm_k(key)
 
         # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
-        # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
         if encoder_hidden_states is not None:
-            # 在多对象模式下，实现基于attention mask的位置感知文本选择
-            if (self.num_objects > 1 and spatial_kwargs is not None and
-                "curr_fg_masks" in spatial_kwargs and self.object_token_ranges is not None):
+            # 使用完整的文本embeddings（暂时）
+            # TODO: 实现位置感知的文本选择
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
 
-                curr_fg_masks = spatial_kwargs["curr_fg_masks"]
-                text_len = encoder_hidden_states.shape[1]
+            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
 
-                # 创建位置到对象的映射（缓存以提高效率）
-                if not hasattr(self, "position_to_object") or self.position_to_object is None:
-                    self.position_to_object = torch.zeros(self.visual_seq_len, dtype=torch.long, device=curr_fg_masks[0].device)
-                    for obj_idx, obj_mask in enumerate(curr_fg_masks):
-                        flat_mask = obj_mask.flatten()
-                        self.position_to_object[flat_mask] = obj_idx + 1  # 1, 2, 3... 表示对象索引
+            if attn.norm_added_q is not None:
+                encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
+            if attn.norm_added_k is not None:
+                encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
 
-                # 使用完整的文本embeddings（保持标准attention架构）
-                encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-                encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-                encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-
-                encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-                encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-                encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-
-                if attn.norm_added_q is not None:
-                    encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
-                if attn.norm_added_k is not None:
-                    encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-
-                # 先处理encoder_hidden_states的projections
-                encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-                encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-                encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-
-                encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-                encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-                encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
-                    batch_size, -1, attn.heads, head_dim
-                ).transpose(1, 2)
-
-                if attn.norm_added_q is not None:
-                    encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
-                if attn.norm_added_k is not None:
-                    encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-
-                # 创建位置感知的attention mask（在拼接之后）
-                total_seq_len = encoder_hidden_states_query_proj.shape[2] + query.shape[2]  # 文本 + 视觉序列长度
-
-                # attention_mask shape: [batch, heads, query_len, key_len]
-                attention_mask = torch.zeros(
-                    (batch_size, attn.heads, total_seq_len, total_seq_len),
-                    dtype=torch.float32, device=query.device)
-
-                # 为每个batch设置attention mask
-                for b in range(batch_size):
-                    # 限制文本内部的attention（对象tokens不能相互attention）
-                    for text_pos in range(text_len):
-                        # 确定这个文本token属于哪个对象
-                        token_obj_id = 0  # 背景
-                        if hasattr(self, "bg_len") and text_pos >= self.bg_len:
-                            # 找到这个token属于哪个对象
-                            for obj_idx, (start_token, end_token) in enumerate(self.object_token_ranges):
-                                if start_token <= text_pos < end_token:
-                                    token_obj_id = obj_idx + 1
-                                    break
-
-                        # 这个文本token只能attend到相同对象的其他tokens
-                        for other_text_pos in range(text_len):
-                            other_token_obj_id = 0  # 背景
-                            if hasattr(self, "bg_len") and other_text_pos >= self.bg_len:
-                                for obj_idx, (start_token, end_token) in enumerate(self.object_token_ranges):
-                                    if start_token <= other_text_pos < end_token:
-                                        other_token_obj_id = obj_idx + 1
-                                        break
-
-                            # 如果是不同对象的tokens，屏蔽attention
-                            if token_obj_id != other_token_obj_id and token_obj_id != 0 and other_token_obj_id != 0:
-                                attention_mask[b, :, text_pos, other_text_pos] = float("-inf")
-
-                    # 视觉到文本的attention（根据位置限制）
-                    for visual_pos in range(self.visual_seq_len):
-                        obj_id = self.position_to_object[visual_pos]  # 0=背景, 1=对象1, 2=对象2
-
-                        # 确定这个视觉位置可以attend的文本tokens
-                        allowed_text_tokens = torch.zeros(text_len, dtype=torch.bool, device=query.device)
-
-                        # 所有位置都可以看到背景tokens
-                        if hasattr(self, "bg_len"):
-                            allowed_text_tokens[:self.bg_len] = True
-
-                        # 对象位置还可以看到对应对象的tokens
-                        if obj_id > 0 and obj_id <= len(self.object_token_ranges):
-                            start_token, end_token = self.object_token_ranges[obj_id - 1]
-                            allowed_text_tokens[start_token:end_token] = True
-
-                        # 设置attention mask：视觉位置只能attend到允许的文本tokens
-                        # 注意：视觉位置在拼接后的query中的索引
-                        query_pos_in_total = text_len + visual_pos  # 文本在前，视觉在后
-
-                        for text_token_idx in range(text_len):
-                            if not allowed_text_tokens[text_token_idx]:
-                                # 屏蔽不允许的文本tokens
-                                attention_mask[b, :, query_pos_in_total, text_token_idx] = float("-inf")
-
-            # attention with mask
+            # attention
             query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
             key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
             value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
         
-        if save_attn_kv:
-            if timestep_ind not in self.id_attn_bank:
-                self.id_attn_bank[timestep_ind] = dict()
-            self.id_attn_bank[timestep_ind]["key"] = key[:, :, self.text_seq_len:, :].cpu()
-            self.id_attn_bank[timestep_ind]["value"] = value[:, :, self.text_seq_len:, :].cpu()
-        
-        if update_attn_kv:
-            if timestep_ind not in self.id_attn_bank:
-                self.id_attn_bank[timestep_ind] = dict()
-            self.id_attn_bank[timestep_ind]["updated_key"] = key[:, :, self.text_seq_len:, :].cpu()
-            self.id_attn_bank[timestep_ind]["updated_value"] = value[:, :, self.text_seq_len:, :].cpu()
-
-        if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
 
@@ -528,31 +395,25 @@ class CharaConsistAttnProcessor2_0:
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
 
-        # 多对象模式下也使用扩展key-value逻辑，但传递多对象参数
+        # 处理扩展key-value逻辑
         if fg_share_flag or bg_share_flag:
-            # 传递多对象相关参数
-            expand_kwargs = spatial_kwargs.copy()
-            expand_kwargs['num_objects'] = self.num_objects
-            if self.num_objects > 1 and "curr_fg_masks" in spatial_kwargs:
-                expand_kwargs['curr_fg_masks'] = spatial_kwargs["curr_fg_masks"]
-
             saved_key, saved_value, attention_mask = self.get_expanded_key_value(
                 (image_rotary_emb[0][self.text_seq_len:], image_rotary_emb[1][self.text_seq_len:]),
                 bg_share_flag,
                 fg_share_flag,
                 timestep_ind,
                 query.device,
-                **expand_kwargs)
+                **spatial_kwargs)
             key = torch.cat([key, saved_key], dim=2)
             value = torch.cat([value, saved_value], dim=2)
-            attention_mask = attention_mask
+            attn_mask = attention_mask
         else:
-            attention_mask = None
+            # 不使用扩展key-value时，使用None作为attention mask
+            attn_mask = None
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
-
         if save_attn_out_for_sim:
             if timestep_ind not in self.id_attn_bank:
                 self.id_attn_bank[timestep_ind] = dict()
@@ -561,7 +422,7 @@ class CharaConsistAttnProcessor2_0:
             if timestep_ind not in self.id_attn_bank:
                 self.id_attn_bank[timestep_ind] = dict()
             self.id_attn_bank[timestep_ind]["attn_out"] = hidden_states[:, self.text_seq_len:, :].cpu()
-
+        
         if save_cross_sim:
             self.cross_sims = self.get_curr_cross_sim(hidden_states[:, self.text_seq_len:, :], timestep_ind).to("cuda:0", non_blocking=True)
 
